@@ -45,7 +45,7 @@ func newSCContext() (*scContext, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, err := c.NewContext(pcsc.Exclusive)
+	ctx, err := c.NewContext()
 	if err != nil {
 		c.Close()
 		return nil, err
