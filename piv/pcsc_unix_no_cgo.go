@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (!cgo || pcscgo) && (linux || freebsd)
-// +build !cgo pcscgo
+//go:build linux || freebsd
 // +build linux freebsd
 
 package piv
