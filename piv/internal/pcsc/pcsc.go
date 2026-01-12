@@ -239,9 +239,10 @@ func (c *Context) Close() error {
 
 // Connection represents a connection to a specific smartcard.
 type Connection struct {
-	client  *Client
-	context uint32
-	card    int32
+	client   *Client
+	context  uint32
+	card     int32
+	protocol uint32
 }
 
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L141
@@ -258,7 +259,7 @@ type connectRequest struct {
 func (c *Context) Connect(reader string, mode uint32) (*Connection, error) {
 	req := connectRequest{
 		Context:            c.context,
-		ShareMode:          Shared,
+		ShareMode:          mode,
 		PreferredProtocols: ProtocolT1,
 		RV:                 RVSuccess,
 	}
@@ -278,11 +279,11 @@ func (c *Context) Connect(reader string, mode uint32) (*Connection, error) {
 		return nil, fmt.Errorf("card returned no value")
 	}
 	return &Connection{
-		client: c.client, context: c.context, card: req.Card,
+		client: c.client, context: c.context, card: req.Card, protocol: req.ActiveProtocols,
 	}, nil
 }
 
-//https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L172
+// https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L172
 type disconnectRequest struct {
 	Card        int32
 	Disposition uint32
@@ -350,8 +351,70 @@ func (c *Connection) EndTransaction() error {
 	return nil
 }
 
+// https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L207
+type transmitRequest struct {
+	PhProtocol        uint32
+	PhLength          uint32
+	IoSendPciProtocol uint32
+	IoSendPciLength   uint32
+	IoRecvPciProtocol uint32
+	IoRecvPciLength   uint32
+	CbSendLength      uint32
+	PcbRecvLength     uint32
+	Card              int32
+	RV                uint32
+}
+
 func (c *Connection) Transmit(b []byte) ([]byte, error) {
-	return nil, nil
+	req := transmitRequest{
+		PhProtocol:        c.protocol,
+		PhLength:          8,
+		IoSendPciProtocol: c.protocol,
+		IoSendPciLength:   8,
+		IoRecvPciProtocol: c.protocol,
+		IoRecvPciLength:   8,
+		CbSendLength:      uint32(len(b)),
+		PcbRecvLength:     65536 + 256,
+		Card:              c.card,
+		RV:                RVSuccess,
+	}
+
+	buf := &bytes.Buffer{}
+	if err := binary.Write(buf, nativeByteOrder, req); err != nil {
+		return nil, fmt.Errorf("marshaling transmit request: %v", err)
+	}
+	buf.Write(b)
+
+	size := uint32(buf.Len())
+	header := make([]byte, 8)
+	nativeByteOrder.PutUint32(header[0:4], size)
+	nativeByteOrder.PutUint32(header[4:8], commandTransmit)
+
+	if _, err := c.client.conn.Write(header); err != nil {
+		return nil, fmt.Errorf("writing transmit header: %v", err)
+	}
+	if _, err := c.client.conn.Write(buf.Bytes()); err != nil {
+		return nil, fmt.Errorf("writing transmit body: %v", err)
+	}
+
+	var resp transmitRequest
+	if err := binary.Read(c.client.conn, nativeByteOrder, &resp); err != nil {
+		return nil, fmt.Errorf("reading transmit response struct: %v", err)
+	}
+
+	if resp.RV != RVSuccess {
+		return nil, &RVError{RV: resp.RV}
+	}
+
+	if resp.PcbRecvLength > 0 {
+		data := make([]byte, resp.PcbRecvLength)
+		if _, err := io.ReadFull(c.client.conn, data); err != nil {
+			return nil, fmt.Errorf("reading transmit data: %v", err)
+		}
+		return data, nil
+	}
+
+	return []byte{}, nil
 }
 
 func (c *Client) sendMessage(command uint32, req, resp interface{}) error {
