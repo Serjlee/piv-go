@@ -27,7 +27,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -89,6 +88,11 @@ type RVError struct {
 	RV uint32
 }
 
+type scardContext uint32
+type scardHandle uint32
+type scardLong int32
+type scardPad [0]byte
+
 // Error returns a string encoding of the error code. Note that human readable
 // messages are not provided by this package, and are handled by the piv
 // package instead.
@@ -98,7 +102,8 @@ func (r *RVError) Error() string {
 
 // Client represents a connection with the pcscd process.
 type Client struct {
-	conn net.Conn
+	conn         net.Conn
+	versionMinor int32
 }
 
 // Close releases the underlying connection. It does not release any contexts
@@ -111,17 +116,38 @@ func (c *Client) checkVersion() error {
 	req := struct {
 		Major int32
 		Minor int32
-		RV    uint32
+		RV    int32
 	}{majorVersion, minorVersion, RVSuccess}
-	if err := c.sendMessage(commandVersion, req, &req); err != nil {
+
+	body, err := c.sendMessageRaw(commandVersion, req, 12)
+	if err != nil {
 		return fmt.Errorf("send message: %v", err)
 	}
-	if req.RV != RVSuccess {
-		return &RVError{RV: req.RV}
+
+	if len(body) == 4 {
+		rv := nativeByteOrder.Uint32(body)
+		if rv != RVSuccess {
+			return &RVError{RV: rv}
+		}
+		return nil
 	}
-	if req.Major != majorVersion {
-		return fmt.Errorf("unsupported major version of pcscd protocol: %d", req.Major)
+
+	var resp struct {
+		Major int32
+		Minor int32
+		RV    int32
 	}
+	if err := binary.Read(bytes.NewReader(body), nativeByteOrder, &resp); err != nil {
+		return fmt.Errorf("read version response: %v", err)
+	}
+
+	if resp.RV != RVSuccess {
+		return &RVError{RV: uint32(resp.RV)}
+	}
+	if resp.Major != majorVersion {
+		return fmt.Errorf("unsupported major version of pcscd protocol: %d", resp.Major)
+	}
+	c.versionMinor = resp.Minor
 	return nil
 }
 
@@ -144,6 +170,7 @@ type readerState struct {
 	Sharing      int32
 
 	Attr     [maxAttributeSize]byte
+	Padding  [3]byte
 	AttrSize uint32
 	Protocol uint32
 }
@@ -188,15 +215,16 @@ func (c *Client) readers() (states [maxReaders]readerState, err error) {
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L118
 type establishRequest struct {
 	Scope   uint32
-	Context uint32
-	RV      uint32
+	Padding scardPad
+	Context scardContext
+	RV      scardLong
 }
 
 // Context holds an open PCSC context, which is required to perform actions
 // such as starting transactions or transmitting data to a card.
 type Context struct {
 	client  *Client
-	context uint32
+	context scardContext
 }
 
 // NewContext attempts to establish a context with the PCSC daemon. The returned
@@ -211,15 +239,15 @@ func (c *Client) NewContext() (*Context, error) {
 		return nil, fmt.Errorf("establish context: %v", err)
 	}
 	if req.RV != RVSuccess {
-		return nil, &RVError{RV: req.RV}
+		return nil, &RVError{RV: uint32(req.RV)}
 	}
 	return &Context{client: c, context: req.Context}, nil
 }
 
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L118
 type releaseRequest struct {
-	Context uint32
-	RV      uint32
+	Context scardContext
+	RV      scardLong
 }
 
 // Close releases the context with the PCSC daemon.
@@ -232,7 +260,7 @@ func (c *Context) Close() error {
 		return fmt.Errorf("release context: %v", err)
 	}
 	if req.RV != RVSuccess {
-		return &RVError{RV: req.RV}
+		return &RVError{RV: uint32(req.RV)}
 	}
 	return nil
 }
@@ -240,20 +268,21 @@ func (c *Context) Close() error {
 // Connection represents a connection to a specific smartcard.
 type Connection struct {
 	client   *Client
-	context  uint32
-	card     int32
+	context  scardContext
+	card     scardHandle
 	protocol uint32
 }
 
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L141
 type connectRequest struct {
-	Context            uint32
+	Context            scardContext
 	Reader             [maxReaderNameSize]byte
 	ShareMode          uint32
 	PreferredProtocols uint32
-	Card               int32
+	Card               scardHandle
 	ActiveProtocols    uint32
-	RV                 uint32
+	Padding            scardPad
+	RV                 scardLong
 }
 
 func (c *Context) Connect(reader string, mode uint32) (*Connection, error) {
@@ -273,7 +302,7 @@ func (c *Context) Connect(reader string, mode uint32) (*Connection, error) {
 		return nil, fmt.Errorf("send message: %v", err)
 	}
 	if req.RV != RVSuccess {
-		return nil, &RVError{RV: req.RV}
+		return nil, &RVError{RV: uint32(req.RV)}
 	}
 	if req.Card == 0 {
 		return nil, fmt.Errorf("card returned no value")
@@ -285,9 +314,10 @@ func (c *Context) Connect(reader string, mode uint32) (*Connection, error) {
 
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L172
 type disconnectRequest struct {
-	Card        int32
+	Card        scardHandle
 	Disposition uint32
-	RV          uint32
+	Padding     scardPad
+	RV          scardLong
 }
 
 func (c *Connection) Close() error {
@@ -301,15 +331,15 @@ func (c *Connection) Close() error {
 		return fmt.Errorf("send message: %v", err)
 	}
 	if req.RV != RVSuccess {
-		return &RVError{RV: req.RV}
+		return &RVError{RV: uint32(req.RV)}
 	}
 	return nil
 }
 
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L184
 type beginRequest struct {
-	Card int32
-	RV   uint32
+	Card scardHandle
+	RV   scardLong
 }
 
 // BeginTransaction is called before transmitting data to the card.
@@ -323,16 +353,17 @@ func (c *Connection) BeginTransaction() error {
 		return fmt.Errorf("send message: %v", err)
 	}
 	if req.RV != RVSuccess {
-		return &RVError{RV: req.RV}
+		return &RVError{RV: uint32(req.RV)}
 	}
 	return nil
 }
 
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L195
 type endRequest struct {
-	Card        int32
+	Card        scardHandle
 	Disposition uint32
-	RV          uint32
+	Padding     scardPad
+	RV          scardLong
 }
 
 func (c *Connection) EndTransaction() error {
@@ -346,29 +377,99 @@ func (c *Connection) EndTransaction() error {
 		return fmt.Errorf("send message: %v", err)
 	}
 	if req.RV != RVSuccess {
-		return &RVError{RV: req.RV}
+		return &RVError{RV: uint32(req.RV)}
 	}
 	return nil
 }
 
 // https://github.com/LudovicRousseau/PCSC/blob/1.9.0/src/winscard_msg.h#L207
 type transmitRequest struct {
-	PhProtocol        uint32
-	PhLength          uint32
+	Card              scardHandle
+	IoSendPciProtocol uint32
+	IoSendPciLength   uint32
+	CbSendLength      uint32
+	IoRecvPciProtocol uint32
+	IoRecvPciLength   uint32
+	PcbRecvLength     uint32
+	RV                scardLong
+}
+
+type transmitRequestOld struct {
 	IoSendPciProtocol uint32
 	IoSendPciLength   uint32
 	IoRecvPciProtocol uint32
 	IoRecvPciLength   uint32
 	CbSendLength      uint32
 	PcbRecvLength     uint32
-	Card              int32
-	RV                uint32
+	Card              scardHandle
+	RV                scardLong
 }
 
 func (c *Connection) Transmit(b []byte) ([]byte, error) {
+	if c.client.versionMinor < 4 {
+		return c.transmitOld(b)
+	}
+
 	req := transmitRequest{
-		PhProtocol:        c.protocol,
-		PhLength:          8,
+		Card:              c.card,
+		IoSendPciProtocol: c.protocol,
+		IoSendPciLength:   8,
+		CbSendLength:      uint32(len(b)),
+		IoRecvPciProtocol: c.protocol,
+		IoRecvPciLength:   8,
+		PcbRecvLength:     65536 + 256,
+		RV:                RVSuccess,
+	}
+
+	buf := &bytes.Buffer{}
+	if err := binary.Write(buf, nativeByteOrder, req); err != nil {
+		return nil, fmt.Errorf("marshaling transmit request: %v", err)
+	}
+	buf.Write(b)
+
+	size := uint32(binary.Size(req))
+	header := make([]byte, 8)
+	nativeByteOrder.PutUint32(header[0:4], size)
+	nativeByteOrder.PutUint32(header[4:8], commandTransmit)
+
+	if _, err := c.client.conn.Write(header); err != nil {
+		return nil, fmt.Errorf("writing transmit header: %v", err)
+	}
+	if _, err := c.client.conn.Write(buf.Bytes()); err != nil {
+		return nil, fmt.Errorf("writing transmit body: %v", err)
+	}
+
+	// Read response body safely using known struct size
+	// We assume no header in response or fixed size response
+	readingSize := uint32(binary.Size(req))
+	body := make([]byte, readingSize)
+	if _, err := io.ReadFull(c.client.conn, body); err != nil {
+		return nil, fmt.Errorf("read response body: %v", err)
+	}
+
+	bufReader := bytes.NewReader(body)
+	var resp transmitRequest
+	if err := binary.Read(bufReader, nativeByteOrder, &resp); err != nil {
+		return nil, fmt.Errorf("reading transmit response struct: %v (minor=%d, size=%d)", err, c.client.versionMinor, readingSize)
+	}
+
+	if resp.RV != RVSuccess {
+		return nil, &RVError{RV: uint32(resp.RV)}
+	}
+
+	if resp.PcbRecvLength > 0 {
+		data := make([]byte, resp.PcbRecvLength)
+		if _, err := io.ReadFull(c.client.conn, data); err != nil {
+			return nil, fmt.Errorf("reading transmit data: %v", err)
+		}
+		return data, nil
+	}
+
+	return []byte{}, nil
+}
+
+func (c *Connection) transmitOld(b []byte) ([]byte, error) {
+	req := transmitRequestOld{
 		IoSendPciProtocol: c.protocol,
 		IoSendPciLength:   8,
 		IoRecvPciProtocol: c.protocol,
@@ -397,13 +498,20 @@ func (c *Connection) Transmit(b []byte) ([]byte, error) {
 		return nil, fmt.Errorf("writing transmit body: %v", err)
 	}
 
-	var resp transmitRequest
-	if err := binary.Read(c.client.conn, nativeByteOrder, &resp); err != nil {
-		return nil, fmt.Errorf("reading transmit response struct: %v", err)
+	readingSize := uint32(binary.Size(req))
+	body := make([]byte, readingSize)
+	if _, err := io.ReadFull(c.client.conn, body); err != nil {
+		return nil, fmt.Errorf("read response body: %v", err)
+	}
+
+	bufReader := bytes.NewReader(body)
+	var resp transmitRequestOld
+	if err := binary.Read(bufReader, nativeByteOrder, &resp); err != nil {
+		return nil, fmt.Errorf("reading transmit response struct: %v (minor=%d, size=%d)", err, c.client.versionMinor, readingSize)
 	}
 
 	if resp.RV != RVSuccess {
-		return nil, &RVError{RV: resp.RV}
+		return nil, &RVError{RV: uint32(resp.RV)}
 	}
 
 	if resp.PcbRecvLength > 0 {
@@ -418,11 +526,29 @@ func (c *Connection) Transmit(b []byte) ([]byte, error) {
 }
 
 func (c *Client) sendMessage(command uint32, req, resp interface{}) error {
+	respSize := 0
+	if resp != nil {
+		respSize = binary.Size(resp)
+	}
+	body, err := c.sendMessageRaw(command, req, uint32(respSize))
+	if err != nil {
+		return err
+	}
+	if resp != nil {
+		respData := bytes.NewReader(body)
+		if err := binary.Read(respData, nativeByteOrder, resp); err != nil {
+			return fmt.Errorf("read response: %v (got %d bytes), %w", err, len(body), err)
+		}
+	}
+	return nil
+}
+
+func (c *Client) sendMessageRaw(command uint32, req interface{}, respSize uint32) ([]byte, error) {
 	var data []byte
 	if req != nil {
 		b := &bytes.Buffer{}
 		if err := binary.Write(b, nativeByteOrder, req); err != nil {
-			return fmt.Errorf("marshaling message body: %v", err)
+			return nil, fmt.Errorf("marshaling message body: %v", err)
 		}
 
 		size := uint32(b.Len())
@@ -438,20 +564,19 @@ func (c *Client) sendMessage(command uint32, req, resp interface{}) error {
 	}
 
 	if _, err := c.conn.Write(data); err != nil {
-		return fmt.Errorf("write request bytes: %v", err)
+		return nil, fmt.Errorf("write request bytes: %v", err)
 	}
 
-	respData := &bytes.Buffer{}
-	if err := binary.Read(io.TeeReader(c.conn, respData), nativeByteOrder, resp); err != nil {
-		return fmt.Errorf("read response: %v", err)
+	if respSize == 0 {
+		return []byte{}, nil
 	}
 
-	fmt.Fprintln(os.Stderr, "Request:")
-	fmt.Fprintln(os.Stderr, hex.Dump(data[8:]))
+	body := make([]byte, respSize)
+	if _, err := io.ReadFull(c.conn, body); err != nil {
+		return nil, fmt.Errorf("read response body: %v", err)
+	}
 
-	fmt.Fprintln(os.Stderr, "Response:")
-	fmt.Fprintln(os.Stderr, hex.Dump(respData.Bytes()))
-	return nil
+	return body, nil
 }
 
 // Config is used to modify client behavior.

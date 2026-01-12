@@ -125,6 +125,9 @@ type YubiKey struct {
 
 // Close releases the connection to the smart card.
 func (yk *YubiKey) Close() error {
+	if yk.tx != nil {
+		_ = yk.tx.Close()
+	}
 	err1 := yk.h.Close()
 	err2 := yk.ctx.Close()
 	if err1 == nil {
@@ -368,7 +371,7 @@ var (
 	// https://github.com/Yubico/yubico-piv-tool/blob/yubico-piv-tool-1.7.0/lib/ykpiv.c#L1117
 
 	aidManagement = [...]byte{0xa0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x17}
-	aidPIV        = [...]byte{0xa0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00}
+	aidPIV        = [...]byte{0xa0, 0x00, 0x00, 0x03, 0x08}
 	aidYubiKey    = [...]byte{0xa0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01, 0x01}
 )
 

@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/qubesome/piv-go/piv/internal/pcsc"
 )
@@ -55,6 +56,10 @@ func newSCContext() (*scContext, error) {
 
 func (c *scContext) Close() error {
 	err1 := c.ctx.Close()
+	// Horrible hack to ignore "connection reset by peer" errors on close, which seems unevitable
+	if err1 != nil && (strings.Contains(err1.Error(), "connection reset by peer") || strings.Contains(err1.Error(), "broken pipe")) {
+		err1 = nil
+	}
 	if err := c.client.Close(); err != nil {
 		return err
 	}
@@ -78,7 +83,12 @@ func (c *scContext) Connect(reader string) (*scHandle, error) {
 }
 
 func (h *scHandle) Close() error {
-	return scCheck(h.conn.Close())
+	err := h.conn.Close()
+	// Horrible hack to ignore "connection reset by peer" errors on close, which seems unevitable
+	if err != nil && strings.Contains(err.Error(), "connection reset by peer") {
+		return nil
+	}
+	return scCheck(err)
 }
 
 type scTx struct {
